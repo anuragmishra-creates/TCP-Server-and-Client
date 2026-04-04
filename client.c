@@ -9,6 +9,7 @@
 #include <netdb.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <termios.h>
 
 #define BUFFER_SIZE 4096
 #define INDENT "          "
@@ -45,12 +46,15 @@ void print_message(const char *msg, bool type_next_line)
 {
     pthread_mutex_lock(&print_mutex);
 
-    printf("\r\33[K");       // Clear current line
-    printf("%s\n", msg);     // Print incoming message
-    current_input[0] = '\0'; // clear stale input
+    printf("\r\33[K");   // Clear the current line
+    printf("%s\n", msg); // Print the incoming message
+
+    // Reprint the prompt AND whatever the user was typing
     if (type_next_line)
-        printf(WHITE INDENT " [Type]: "); // Reprint prompt
-    fflush(stdout);                       // Print above immediately
+    {
+        printf(WHITE INDENT " [Type]: " RESET "%s", current_input);
+    }
+    fflush(stdout);
 
     pthread_mutex_unlock(&print_mutex);
 }
@@ -132,24 +136,64 @@ void *send_to_server(void *arg)
     (void)arg;
     char buffer[BUFFER_SIZE];
 
+    // Put terminal in raw mode
+    struct termios oldt, newt;
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~(ICANON | ECHO);
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+
     while (true)
     {
-        // If ghost message is still in the buffer, remove it.
+        int pos = 0;
+        current_input[0] = '\0';
         memset(buffer, 0, sizeof(buffer));
 
-        // Keeps on taking input from stdin until EOF (Ctrl+D) or error, then exits and closes the socket.
-        if (fgets(buffer, BUFFER_SIZE, stdin) == NULL)
-            break;
-
-        int total_bytes = strlen(buffer);
-
-        // Ensure message always end with a newline (since server expects \n-terminated messages)
-        if (total_bytes == 0 || buffer[total_bytes - 1] != '\n')
+        // Read character-by-character directly from the OS, bypassing libc entirely
+        while (true)
         {
-            buffer[total_bytes] = '\n';
-            buffer[total_bytes + 1] = '\0';
-            total_bytes++;
+            char c;
+            int n = read(STDIN_FILENO, &c, 1);
+            if (n <= 0)
+                break; // EOF or error
+
+            if (c == '\n')
+            {
+                pthread_mutex_lock(&print_mutex);
+                current_input[pos++] = '\n';
+                current_input[pos] = '\0';
+                printf("\n");
+                pthread_mutex_unlock(&print_mutex);
+                break;
+            }
+            else if (c == 127 || c == '\b') // Backspace
+            {
+                if (pos > 0)
+                {
+                    pthread_mutex_lock(&print_mutex);
+                    pos--;
+                    current_input[pos] = '\0';
+                    printf("\b \b");
+                    fflush(stdout);
+                    pthread_mutex_unlock(&print_mutex);
+                }
+            }
+            else if (pos < BUFFER_SIZE - 2 && c >= 32 && c <= 126) // Normal typing
+            {
+                pthread_mutex_lock(&print_mutex);
+                current_input[pos++] = c;
+                current_input[pos] = '\0';
+                printf("%c", c);
+                fflush(stdout);
+                pthread_mutex_unlock(&print_mutex);
+            }
         }
+
+        if (pos == 0)
+            break; // EOF
+
+        strcpy(buffer, current_input);
+        current_input[0] = '\0'; // Clear immediately so incoming messages don't print old text
 
         if (strcmp(buffer, "/exit\n") == 0)
             break;
@@ -164,6 +208,7 @@ void *send_to_server(void *arg)
             continue;
         }
 
+        int total_bytes = strlen(buffer);
         int total_bytes_sent = 0;
         while (total_bytes_sent < total_bytes)
         {
@@ -174,17 +219,18 @@ void *send_to_server(void *arg)
                 total_bytes_sent += n;
             else if (n == -1)
             {
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) // retry on interrupt or buffer full
+                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
                     continue;
                 if (errno == ECONNRESET)
                     print_message(RED "The server disconnected abruptly.\n" RESET, false);
                 if (errno == EPIPE)
                     print_message(RED "The server disconnected (maybe gracefully or abruptly).\n" RESET, false);
+
+                tcsetattr(STDIN_FILENO, TCSANOW, &oldt); // Restore terminal state on fail
                 pthread_exit(NULL);
             }
         }
 
-        // Print the sent message with timestamp and [You] tag:
         buffer[strcspn(buffer, "\n")] = '\0';
         char timestamp[20];
         get_timestamp(timestamp);
@@ -209,11 +255,12 @@ void *send_to_server(void *arg)
             snprintf(formatted, sizeof(formatted), GREEN "[%s] [You]: %s" RESET, timestamp, buffer);
 
         print_message(formatted, true);
-        current_input[0] = '\0';
     }
+
+    // Restore terminal state before exiting gracefully
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
     pthread_exit(NULL);
 }
-
 int main(int argc, char *argv[])
 {
     if (argc < 3)
