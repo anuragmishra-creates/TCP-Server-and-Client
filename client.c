@@ -36,8 +36,9 @@ void error(const char *msg)
 void get_timestamp(char *buffer)
 {
     time_t now = time(NULL);
-    struct tm *t = localtime(&now);
-    strftime(buffer, 20, "%H:%M:%S", t);
+    struct tm t;
+    localtime_r(&now, &t);
+    strftime(buffer, 20, "%H:%M:%S", &t);
 }
 
 void print_message(const char *msg, bool type_next_line)
@@ -93,12 +94,10 @@ void *receive_from_server(void *arg)
                         sprintf(formatted, "%s[%s] %s%s", CYAN, timestamp, line, RESET);
                     else if (strncmp(line, "[Direct Message", 15) == 0)
                         sprintf(formatted, "%s[%s] %s%s", MAGENTA, timestamp, line, RESET);
-                    else if (strstr(line, "[Server]: Available commands") || strstr(line, "/"))
-                        sprintf(formatted, "%s[%s] %s%s", BLUE, timestamp, line, RESET);
                     else if (strncmp(line, "[Server", 7) == 0)
                         sprintf(formatted, "%s[%s] %s%s", RED, timestamp, line, RESET);
-                    else if (strstr(line, "connected") || strstr(line, "disconnected"))
-                        sprintf(formatted, "%s[%s] %s%s", RED, timestamp, line, RESET);
+                    else if (strncmp(line, INDENT, strlen(INDENT)) == 0)
+                        sprintf(formatted, "%s[%s] %s%s", BLUE, timestamp, line, RESET);
                     else
                         sprintf(formatted, "[%s] %s", timestamp, line);
                     print_message(formatted, true);
@@ -135,6 +134,9 @@ void *send_to_server(void *arg)
 
     while (true)
     {
+        // If ghost message is still in the buffer, remove it.
+        memset(buffer, 0, sizeof(buffer));
+
         // Keeps on taking input from stdin until EOF (Ctrl+D) or error, then exits and closes the socket.
         if (fgets(buffer, BUFFER_SIZE, stdin) == NULL)
             break;
@@ -154,9 +156,11 @@ void *send_to_server(void *arg)
 
         if (strcmp(buffer, "/clear\n") == 0)
         {
+            pthread_mutex_lock(&print_mutex);
             printf("\033[2J\033[H");
             printf(WHITE INDENT " [Type]: " RESET);
             fflush(stdout);
+            pthread_mutex_unlock(&print_mutex);
             continue;
         }
 
@@ -181,47 +185,31 @@ void *send_to_server(void *arg)
         }
 
         // Print the sent message with timestamp and [You] tag:
-        // Remove '\n' for display ONLY (do this AFTER sending to server)
         buffer[strcspn(buffer, "\n")] = '\0';
-
         char timestamp[20];
         get_timestamp(timestamp);
-
         char formatted[BUFFER_SIZE + 200];
 
         if (strncmp(buffer, "/all ", 5) == 0)
-            snprintf(formatted, sizeof(formatted), GREEN "[%s] [You Broadcasted]: %s" RESET, timestamp, buffer + 5);
+            snprintf(formatted, sizeof(formatted), GREEN "[%s] [Your Broadcast]: %s" RESET, timestamp, buffer + 5);
         else if (strncmp(buffer, "/dm ", 4) == 0)
         {
             char temp[BUFFER_SIZE];
-            strcpy(temp, buffer + 4); // SAFE COPY (important)
+            strcpy(temp, buffer + 4);
 
             char *user = strtok(temp, " ");
             char *msg = strtok(NULL, "");
 
             if (user && msg)
-                snprintf(formatted, sizeof(formatted), GREEN "[%s] [You Direct Messaged to %s]: %s" RESET, timestamp, user, msg);
+                snprintf(formatted, sizeof(formatted), GREEN "[%s] [Your Direct Message to %s]: %s" RESET, timestamp, user, msg);
             else
                 snprintf(formatted, sizeof(formatted), RED "[Invalid DM format]" RESET);
         }
-        else if (buffer[0] == '/')
-            formatted[0] = '\0'; // Don't print commands like /list
         else
-            snprintf(formatted, sizeof(formatted), GREEN "[%s] [You Broadcasted]: %s" RESET, timestamp, buffer);
+            snprintf(formatted, sizeof(formatted), GREEN "[%s] [You]: %s" RESET, timestamp, buffer);
 
-        // Only print if something valid
-        if (formatted[0] != '\0')
-        {
-            print_message(formatted, true);
-            current_input[0] = '\0';
-        }
-
-        // char timestamp[20];
-        // get_timestamp(timestamp);
-        // char formatted[BUFFER_SIZE + 100];
-        // sprintf(formatted, GREEN "[%s] [You]: %s" RESET, timestamp, buffer);
-        // print_message(formatted, true);
-        // current_input[0] = '\0';
+        print_message(formatted, true);
+        current_input[0] = '\0';
     }
     pthread_exit(NULL);
 }

@@ -24,8 +24,6 @@
 // write() slows when kernel buffer is full due to slow network, but read() slows because it waits for data to arrive from the network.
 // read() blocks (sleeps) the current thread till data is unavailable, the other socket is NOT closed and NO error.
 
-time_t server_start_time;
-
 void error(const char *msg)
 {
     perror(msg);
@@ -37,12 +35,14 @@ typedef struct
     bool active;
     int client_fd;
     char username[MAX_USERNAME_LEN];
-
+    time_t join_time;
+    int msg_count;
     char read_buf[BUFFER_SIZE];
     int buf_len;
 } Client;
 
 Client clients[MAX_CLIENTS];
+time_t server_start_time;
 pthread_mutex_t lock; // For synchronizing access to the clients[] array
 
 // Must be called with the lock held
@@ -52,6 +52,9 @@ void reset_slot(Client *client)
     client->client_fd = -1;
     client->username[0] = '\0';
     client->buf_len = 0;
+    client->join_time = 0;
+    client->msg_count = 0;
+    memset(client->read_buf, 0, sizeof(client->read_buf));
 }
 
 // Passes the entire (not partial) message
@@ -112,11 +115,11 @@ int receive_from_client(Client *client, char *out, int max_len)
 
         if (client->buf_len >= BUFFER_SIZE - 1)
         {
-            // buffer full → reset or error
             client->buf_len = 0;
             return -1;
         }
-        // Step 2: No full line → read more data
+
+        // We don't have a full line yet, so we need to read more data from the socket:
         int n = read(client->client_fd, client->read_buf + client->buf_len, BUFFER_SIZE - client->buf_len - 1);
         if (n > 0)
         {
@@ -133,32 +136,6 @@ int receive_from_client(Client *client, char *out, int max_len)
         }
     }
 }
-
-/*
-Old version without buffering (may cause issues with partial reads and multiple lines in one read):
-int receive_from_client(int client_fd, char *buffer, int size)
-{
-    bzero(buffer, size);
-    while (true)
-    {
-        int n = read(client_fd, buffer, size - 1);
-        if (n > 0)
-        {
-            buffer[strcspn(buffer, "\n")] = '\0';
-            return n;
-        }
-        else if (n == 0) // client closed
-            return 0;
-        else
-        {
-            if (errno == EINTR)
-                continue; // retry
-            return -1;    // forceful disconnection or other error
-        }
-    }
-    return -1;
-}
-*/
 
 void broadcast(int exclude_sock, const char *fmt, ...)
 {
@@ -213,25 +190,10 @@ int find_client_by_name(const char *name)
     return -1;
 }
 
-int find_empty_slot()
-{
-    pthread_mutex_lock(&lock);
-    for (int i = 0; i < MAX_CLIENTS; i++)
-    {
-        if (!clients[i].active)
-        {
-            pthread_mutex_unlock(&lock);
-            return i;
-        }
-    }
-    pthread_mutex_unlock(&lock);
-    return -1;
-}
-
 void list_users(int client_fd)
 {
     char buffer[BUFFER_SIZE];
-    strcpy(buffer, "[Server]: Online users:\n");
+    strcpy(buffer, "[Server]: Online users (case-sensitive):\n");
 
     /* Snapshot active usernames while holding the lock, then build
        the printable buffer after unlocking to avoid doing string ops
@@ -254,34 +216,31 @@ void list_users(int client_fd)
     for (int i = 0; i < count; i++)
     {
         size_t len = strlen(buffer);
-        if (len < BUFFER_SIZE - 13) /* 10 spaces + at least 1 char + '\n' + '\0' */
-            snprintf(buffer + len, BUFFER_SIZE - len, "          %s\n", names[i]);
-        else
-        {
-            strcat(buffer, "          ... (more users exist)\n");
-            break;
-        }
+        time_t now = time(NULL);
+        int seconds = now - clients[i].join_time;
+        snprintf(buffer + len, BUFFER_SIZE - len, "          %s (online for %ds)\n", names[i], seconds);
     }
 
     send_to_client(client_fd, "%s", buffer);
 }
 
-bool valid_username(char *username)
+bool valid_username(const char *username)
 {
-    if (!username)
+    if (username == NULL)
         return false;
 
     int len = strlen(username);
-    if (len == 0 || len >= 50)
+
+    if (len == 0 || len >= MAX_USERNAME_LEN)
         return false;
 
     for (int i = 0; i < len; i++)
     {
         unsigned char c = (unsigned char)username[i];
-        if (isspace(c) || !isprint(c))
+        // Allow only: a-z, A-Z, 0-9, _
+        if (!isalnum(c) && c != '_')
             return false;
     }
-
     return true;
 }
 
@@ -300,7 +259,7 @@ void *handle_client(void *arg)
     temp_client.client_fd = client_fd;
     while (true)
     {
-        int n = send_to_client(client_fd, "[Server]: Enter your username\n");
+        int n = send_to_client(client_fd, "[Server]: Enter your case-sensitive username (only alphabets, digits and underscores allowed)\n");
         if (n < 0)
         {
             close(client_fd);
@@ -316,7 +275,7 @@ void *handle_client(void *arg)
 
         if (!valid_username(username))
         {
-            send_to_client(client_fd, "[Server]: Invalid username! Try another username.\n");
+            send_to_client(client_fd, "[Server]: Invalid username! Try another username with only alphabets, digits and underscores.\n");
             continue;
         }
 
@@ -332,18 +291,30 @@ void *handle_client(void *arg)
     }
 
     // Server capacity check and client registration:
-    int client_index = find_empty_slot();
+    pthread_mutex_lock(&lock);
+    int client_index = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (!clients[i].active)
+        {
+            client_index = i;
+            break;
+        }
+    }
+
     if (client_index == -1)
     {
+        pthread_mutex_unlock(&lock);
         send_to_client(client_fd, "[Server]: The Server is currently full. Try again later!\n");
         close(client_fd);
         pthread_exit(NULL);
     }
-    pthread_mutex_lock(&lock);
+
     clients[client_index].active = true;
     clients[client_index].client_fd = client_fd;
     strncpy(clients[client_index].username, username, MAX_USERNAME_LEN);
     clients[client_index].username[MAX_USERNAME_LEN - 1] = '\0';
+    clients[client_index].join_time = time(NULL);
     pthread_mutex_unlock(&lock);
 
     // Joining the chat:
@@ -367,6 +338,7 @@ void *handle_client(void *arg)
             broadcast(client_fd, "[Server]: Error receiving message from %s\n", username);
             break;
         }
+        clients[client_index].msg_count++;
 
         // Commands handling:
         if (strcmp(buffer, "/exit") == 0)
@@ -397,21 +369,72 @@ void *handle_client(void *arg)
             else
                 send_to_client(client_fd, "[Server]: The server's uptime is %d seconds\n", seconds);
         }
+        else if (strcmp(buffer, "/time") == 0)
+        {
+            time_t now = time(NULL);
+            char t[26];
+            ctime_r(&now, t);
+            t[strcspn(t, "\n")] = '\0';
+            send_to_client(client_fd, "[Server]: Current server time is %s\n", t);
+        }
+        else if (strcmp(buffer, "/since") == 0)
+        {
+            time_t now = time(NULL);
+            int seconds = now - clients[client_index].join_time;
+            send_to_client(client_fd, "[Server]: You joined %d seconds ago\n", seconds);
+        }
         else if (strcmp(buffer, "/users") == 0)
         {
             list_users(client_fd);
         }
+        else if (strcmp(buffer, "/stats") == 0)
+        {
+            int count = clients[client_index].msg_count;
+            send_to_client(client_fd, "[Server]: You sent %d messages\n", count);
+        }
         else if (strncmp(buffer, "/help", 5) == 0)
         {
             send_to_client(client_fd, "[Server]: Available Commands:\n"
+                                      "          /help                         : display this help message\n"
                                       "          /users                        : show all the online users\n"
                                       "          /dm <username> <message>      : private message\n"
                                       "          /all <message>                : broadcast\n"
                                       "          /whoami                       : display your username\n"
+                                      "          /rename <new_username>        : change your username\n"
+                                      "          /stats                        : display your message statistics\n"
                                       "          /uptime                       : display server uptime\n"
-                                      "          /help                         : display this help message\n"
+                                      "          /time                         : display current server time\n"
+                                      "          /since                        : display how long you have been connected\n"
                                       "          /clear                        : clear the screen (client-side only)\n"
                                       "          /exit                         : exit\n");
+        }
+        else if (strncmp(buffer, "/rename ", 8) == 0)
+        {
+            char new_name[MAX_USERNAME_LEN];
+            sscanf(buffer + 8, "%49s", new_name);
+
+            if (!valid_username(new_name))
+            {
+                send_to_client(client_fd, "[Server]: Invalid username! (Only alphabets, digits and underscores are allowed)\n");
+                continue;
+            }
+
+            pthread_mutex_lock(&lock);
+            int existing_index = find_client_by_name(new_name);
+            if (existing_index != -1)
+            {
+                pthread_mutex_unlock(&lock);
+                send_to_client(client_fd, "[Server]: Username already taken!\n");
+                continue;
+            }
+
+            char old_name[MAX_USERNAME_LEN];
+            strcpy(old_name, clients[client_index].username);
+            strcpy(clients[client_index].username, new_name);
+            strcpy(username, new_name); // Update local variable for /whoami, /exit, other errors, etc.
+            pthread_mutex_unlock(&lock);
+
+            broadcast(client_fd, "[Server]: %s renamed to %s\n", old_name, new_name);
         }
         else if (strcmp(buffer, "/all") == 0)
         {
@@ -456,7 +479,7 @@ void *handle_client(void *arg)
             }
         }
         else
-            broadcast(client_fd, "[Broadcast from %s]: %s\n", username, buffer);
+            send_to_client(client_fd, "[Server]: Invalid command!\n");
     }
 
     // Remove  the client:
