@@ -117,6 +117,7 @@ This ensures a smooth, uninterrupted typing experience.
 | `/dm <username> <message>` | Sends private message |
 | `/all <message>` | Broadcast message |
 | `/whoami` | Shows current username |
+| `/rename <new_username>`| Change current username |
 | `/stats` | Displays total messages sent |
 | `/uptime` | Shows server uptime (D:H:M:S) |
 | `/time` | Returns server timestamp (`ctime_r`) |
