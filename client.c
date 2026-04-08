@@ -121,7 +121,7 @@ void *receive_from_server(void *arg)
         }
         else
         {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EINTR)
                 continue;
             print_message(RED "The server disconnected abruptly.\n" RESET, false);
             pthread_exit(NULL);
@@ -219,12 +219,12 @@ void *send_to_server(void *arg)
                 total_bytes_sent += n;
             else if (n == -1)
             {
-                if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+                if (errno == EINTR)
                     continue;
                 if (errno == ECONNRESET)
                     print_message(RED "The server disconnected abruptly.\n" RESET, false);
                 if (errno == EPIPE)
-                    print_message(RED "The server disconnected (maybe gracefully or abruptly).\n" RESET, false);
+                    print_message(RED "The server disconnected gracefully.\n" RESET, false);
 
                 tcsetattr(STDIN_FILENO, TCSANOW, &oldt); // Restore terminal state on fail
                 pthread_exit(NULL);
@@ -299,7 +299,17 @@ int main(int argc, char *argv[])
 
     // Terminating:
     pthread_join(send_thread, NULL);
-    shutdown(sock_fd, SHUT_RDWR);
+    shutdown(sock_fd, SHUT_RDWR); // We reach here only when sending is done (either by "/exit" or error), so we shutdown the socket to unblock the receive thread if it's waiting on read()
     pthread_join(recv_thread, NULL);
+
+    /*
+        Reason behind shutdown() before joining the receive thread:
+        When the user types "/exit", the send thread will exit, but the receive thread might still be blocked on read()
+        waiting for messages from the server. By calling shutdown(sock_fd, SHUT_RDWR), we signal to the server
+        that we won't send or receive any more data. This will cause the server to close its end of the connection,
+        which in turn will cause the receive thread's read() to return 0,
+        allowing it to exit. If we didn't call shutdown(), the receive thread might remain blocked
+        indefinitely, preventing the program from terminating properly.
+    */
     return 0;
 }
