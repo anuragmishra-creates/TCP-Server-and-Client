@@ -69,21 +69,55 @@ We went above and beyond the standard requirements to create a highly polished, 
 ### 1. Seamless Concurrent Terminal I/O (Bypassing Canonical Mode)
 
 #### The Problem
-Standard C input functions like `fgets()` rely on OS-level line buffering. This causes incoming server messages to overwrite the user's partially typed input.
+By default, terminals operate in Canonical Mode, which buffers user input until the 'Enter' key is pressed. This creates severe UI conflicts in a multithreaded chat environment where incoming messages can asynchronously interrupt a user while they are typing.
 
-#### Our Solution
-We implemented low-level terminal control using `<termios.h>`:
+Example: Suppose you are typing "/all Hello, world!". Before you can finish, and are only at the "Hello" stage, a message arrives from the server. Because the incoming message and your keyboard input share the same terminal screen (stdout), the output becomes garbled:
 
-- Disabled **Canonical Mode** and **ECHO**
-- Captured raw character input using `read()`
-- Maintained a local input buffer
-- Reprinted:
-  - Prompt
-  - User’s unfinished input
-  whenever an asynchronous message arrives
+``` bash
+          [Type]: /all Hello[10:45:02] [Direct Message from Eren_Jaeger]: This is my message!
+          [Type]: 
+```
+
+Now no matter what we type, the past message "/all Hello" is STILL in the stdin buffer (though unknown to the client process) and will be sent to the server along with whatever we type now.
+
+Case I:
+Suppose we type "/all Hello, world!" again and press enter, but now the entire "/all Hello/all Hello, world!" is sent to the server.
+This causes the message "Hello/all Hello, world!" to be broadcasted (the first "/all" is taken as command)!
+Even if though we could just continue from what is fixed to be sent "/all Hello" by typing ", world!", the UI is broken and case II is even a bigger issue.
+
+Case II:
+Suppose we don't want the "/all Hello" to be first part of what we send to the server. We now cannot do anything about it as it is LOCKED in the stdin buffer (not visible to the client process) and backspace WILL NOT work anymore. The message interrupt breaks the backspace and we cannot delete what we wrote.
+
+#### Our Requirement
+We wanted the following as the solution when an incoming message arrives:
+(1) Whatever the client types is removed from the screen.
+(2) The incoming message is displayed (printed).
+(3) The client's message is restored.
+
+#### Our Solution:
+We implemented low-level terminal control using `<termios.h>` (terminal control API of Linux):
+
+(I) Disabled ICANON (Canonical Mode):
+
+To ensure the restoration of the client's half typed message, we ensure that whatever the client types is stored live in the current_input[] buffer. Note: the contents of the current_input[] buffer are not yet passed to the server till an enter is received as input from the client.
+Since we wanted to capture live characters, we disabled the default (canonical) mode and thus the terminal was using raw mode (reading character letter by letter).
+
+Now, the client process could easily come to know what the client had typed before the incoming message arrived and store it in current_line[] buffer, which can be later restored.
+
+The partial-written message is cleared using carriage return and deleting everything from there.
+The incoming message is printed. 
+The partial-written, client message is restored in the terminal for doing the modifications (continue from there, delete it, edit it, etc).
+Once the client is done and presses enter, the current_line[] buffer's content is copied down to the main client buffer that contains the message to be sent in its entirety.
+
+(II) Disabled ECHO Mode:
+
+ICANON (Canonical mode) reads inputs byte-by-byte. When ICANON is off but ECHO is on, the terminal behaves differently with control characters.
+
+If the ECHO mode is ON and the Backspace key is pressed, the OS might simply echo the literal control character representation (often displayed as ^? or ^H) instead of actually moving the cursor left and deleting the character on the screen.
+
+By handling it manually, it is ensured that printf("\b \b") accurately (visually and really) deletes the character to match exactly what is done to the current_input buffer.
 
 This ensures a smooth, uninterrupted typing experience.
-
 ---
 
 ### 2. Robust User Authentication & Session Management
@@ -180,18 +214,18 @@ This system is not just a basic chat application — it mimics an **advanced ter
 ## 📸 Preview
 
 ### SS1: 
-![Server Startup](media/SS1.png)
+![](media/SS1.png)
 
 ### SS2:
-![Client Connection](media/SS2.png)
+![](media/SS2.png)
 
 ### SS3:
-![Private Messaging](media/SS3.png)
+![](media/SS3.png)
 
 ### SS4:
-![Broadcast Messaging](media/SS4.png)
+![](media/SS4.png)
 
 ### SS5:
-![Advanced Features](media/SS5.png)
+![](media/SS5.png)
 
 ---
