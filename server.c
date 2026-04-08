@@ -17,12 +17,15 @@
 #define QUEUE_SIZE 100
 #define BUFFER_SIZE 4096
 #define MAX_USERNAME_LEN 50
+#define INDENT "          "
 
 // Note: 1 write == 1 read is NOT true necessarily.
 // read() may read only partial data and move on to the next line.
 
 // write() slows when kernel buffer is full due to slow network, but read() slows because it waits for data to arrive from the network.
 // read() blocks (sleeps) the current thread till data is unavailable, the other socket is NOT closed and NO error.
+
+// The client can disconnected any time but the cleanup (in clients[]) by the corresponding thread can only be done when the thread holds the lock.
 
 void error(const char *msg)
 {
@@ -57,6 +60,17 @@ void reset_slot(Client *client)
     memset(client->read_buf, 0, sizeof(client->read_buf));
 }
 
+// Must hold lock before calling this function
+int find_client_by_name(const char *name)
+{
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].active && strcmp(clients[i].username, name) == 0)
+            return i;
+    }
+    return -1;
+}
+
 // Passes the entire (not partial) message
 int send_to_client(int client_fd, const char *fmt, ...)
 {
@@ -78,22 +92,20 @@ int send_to_client(int client_fd, const char *fmt, ...)
         {
             if (errno == EINTR) // interrupted (retry)
                 continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) // buffer full (rare in blocking mode)
-                continue;
-            if (errno == EPIPE || errno == ECONNRESET) // client gone (abrupt or graceful)
-                return -1;
-            return -1;
+            return -1; // client gone (graceful or abrupt) or other error
         }
     }
     return total_bytes_sent;
 }
 
 // Reads in lines where each line ends with '\n'
+// Does NOT need a mutex because each client is handled by exactly one thread (no sharing)
 int receive_from_client(Client *client, char *out, int max_len)
 {
     while (true)
     {
         // Check if we already have a complete line (ending with '\n') in the buffer:
+        // (Reason: "Hello\nWorld\nI am xyz") was int buffer and Hello was removed but "World\nI am xyz" is still in the buffer.
         for (int i = 0; i < client->buf_len; i++)
         {
             if (client->read_buf[i] == '\n')
@@ -105,15 +117,18 @@ int receive_from_client(Client *client, char *out, int max_len)
                 memcpy(out, client->read_buf, len);
                 out[len] = '\0';
 
-                // Shift remaining data
-                memmove(client->read_buf, client->read_buf + i + 1, client->buf_len - i - 1);
-
-                client->buf_len -= (i + 1);
+                // Shift remaining data:
+                int remaining = client->buf_len - (i + 1);
+                memmove(client->read_buf, client->read_buf + i + 1, remaining);
+                client->buf_len = remaining;
                 return len;
             }
         }
 
-        if (client->buf_len >= BUFFER_SIZE - 1)
+        // Suppose a client is not closing the connection and sending "aaaaaa...."" without '\n',
+        // then the buffer will be full and we will never read more data (due to read's set size) or find a '\n'.
+        // So we need to reset the buffer safely in this case:
+        if (client->buf_len == BUFFER_SIZE - 1)
         {
             client->buf_len = 0;
             return -1;
@@ -126,21 +141,21 @@ int receive_from_client(Client *client, char *out, int max_len)
             client->buf_len += n;
             client->read_buf[client->buf_len] = '\0';
         }
-        else if (n == 0) // client closed
+        else if (n == 0) // client closed gracefully
             return 0;
         else
         {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
+            if (errno == EINTR)
                 continue; // retry or temporary unavailability
-            return -1;    // forceful disconnection or other error
+            return -1;    // client closed abruptly or other error
         }
     }
 }
 
-void broadcast(int exclude_sock, const char *fmt, ...)
+void broadcast(int exclude_sock, const char *fmt, ...) // fmt: formatted string
 {
     char msg[BUFFER_SIZE];
-    va_list ap;
+    va_list ap; // Argument pointer for variable arguments
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
@@ -158,70 +173,62 @@ void broadcast(int exclude_sock, const char *fmt, ...)
     }
     pthread_mutex_unlock(&lock);
 
-    // Send without lock:
+    // Use snapshot (no shared data access): Might get stale by the time it is used for broadcast, but nothing else can be done apart from this.
+    // We guarantee snapshot consistency, not real-time accuracy.
     for (int i = 0; i < MAX_CLIENTS; i++)
     {
         if (fds[i] == -1)
             continue;
 
         int n = send_to_client(fds[i], "%s", msg);
-        if (n < 0)
+        if (n < 0) // Feels redundant
         {
             pthread_mutex_lock(&lock);
             if (clients[i].active && clients[i].client_fd == fds[i])
             {
                 close(clients[i].client_fd);
-                // DO NOT reset the slot here, because the receive_from_client() in the client thread may still be working on this slot,
-                // thus causing race conditions.
+                // Don't use reset_slot because receive_from_client() might be accessing it at the same time.
+                // This might lead to inconsistencies/errors.
+                // reset_slot(&clients[i]);
             }
             pthread_mutex_unlock(&lock);
         }
     }
 }
 
-// Must hold lock before calling this function
-int find_client_by_name(const char *name)
-{
-    for (int i = 0; i < MAX_CLIENTS; i++)
-    {
-        if (clients[i].active && strcmp(clients[i].username, name) == 0)
-            return i;
-    }
-    return -1;
-}
-
-void list_users(int client_fd)
+int list_users(int client_fd)
 {
     char buffer[BUFFER_SIZE];
     strcpy(buffer, "[Server]: Online users (case-sensitive):\n");
 
-    /* Snapshot active usernames while holding the lock, then build
-       the printable buffer after unlocking to avoid doing string ops
-       or I/O while the mutex is held. */
+    // Snapshot structure:
     char names[MAX_CLIENTS][MAX_USERNAME_LEN];
-    int count = 0;
+    time_t join_times[MAX_CLIENTS];
+    int online_count = 0; // Number of online clients at the moment of snapshot
 
+    // Take snapshot under lock
     pthread_mutex_lock(&lock);
-    for (int i = 0; i < MAX_CLIENTS && count < MAX_CLIENTS; i++)
+    for (int i = 0; i < MAX_CLIENTS && online_count < MAX_CLIENTS; i++)
     {
         if (clients[i].active)
         {
-            strncpy(names[count], clients[i].username, sizeof(names[count]));
-            names[count][sizeof(names[count]) - 1] = '\0';
-            count++;
+            strncpy(names[online_count], clients[i].username, sizeof(names[online_count]));
+            join_times[online_count] = clients[i].join_time;
+            online_count++;
         }
     }
     pthread_mutex_unlock(&lock);
 
-    for (int i = 0; i < count; i++)
+    // Use snapshot (no shared data access): Might get stale by the time it is sent, but nothing else can be done apart from this.
+    // We guarantee snapshot consistency, not real-time accuracy.
+    time_t now = time(NULL);
+    for (int i = 0; i < online_count; i++)
     {
         size_t len = strlen(buffer);
-        time_t now = time(NULL);
-        int seconds = now - clients[i].join_time;
-        snprintf(buffer + len, BUFFER_SIZE - len, "          %s (online for %ds)\n", names[i], seconds);
+        int seconds = now - join_times[i];
+        snprintf(buffer + len, BUFFER_SIZE - len, INDENT "%s (online for %ds)\n", names[i], seconds);
     }
-
-    send_to_client(client_fd, "%s", buffer);
+    return send_to_client(client_fd, "%s", buffer);
 }
 
 bool valid_username(const char *username)
@@ -286,8 +293,17 @@ void *handle_client(void *arg)
         if (existing_index == -1)
             break;
 
-        send_to_client(client_fd, "[Server]: Username already taken! Try another username.\n");
-        list_users(client_fd);
+        n = send_to_client(client_fd, "[Server]: Username already taken! Try another username.\n");
+        if (n < 0)
+        {
+            close(client_fd);
+            pthread_exit(NULL);
+        }
+        if (list_users(client_fd) < 0)
+        {
+            close(client_fd);
+            pthread_exit(NULL);
+        }
     }
 
     // Server capacity check and client registration:
@@ -313,16 +329,19 @@ void *handle_client(void *arg)
     clients[client_index].active = true;
     clients[client_index].client_fd = client_fd;
     strncpy(clients[client_index].username, username, MAX_USERNAME_LEN);
-    clients[client_index].username[MAX_USERNAME_LEN - 1] = '\0';
     clients[client_index].join_time = time(NULL);
     pthread_mutex_unlock(&lock);
 
     // Joining the chat:
-    send_to_client(client_fd, "[Server]: Welcome to the chat server!\n");
+    if(send_to_client(client_fd, "[Server]: Welcome to the chat server!\n")< 0)
+    {
+        close(client_fd);
+        pthread_exit(NULL);
+    }
     broadcast(client_fd, "[Server]: %s joined the chat\n", username);
 
     // Messages handling loop:
-    // Note: You don't need to check for return value of send_to_client() and broadcast() in this loop,
+    // Note: You don't need to check for return value of send_to_client() and list_users() in this loop,
     // because if the client disconnects, the next read() will return 0 or -1 and break the loop.
     while (true)
     {
@@ -517,7 +536,7 @@ int main(int argc, char *argv[])
     if (listen_fd < 0)
         error("ERROR opening socket");
     int opt = 1;
-    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)); // Must be called before bind() to be effective, allows quick restart of the server without waiting for TIME_WAIT sockets to expire
 
     // Binding the Listening Socket to the Port and all Interfaces:
     if (bind(listen_fd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0)
